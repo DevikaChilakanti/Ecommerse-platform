@@ -1,0 +1,15 @@
+{
+  "name": "ecommerse-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Full-stack e-commerce platform",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspaces",
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces"
+  }
+}
