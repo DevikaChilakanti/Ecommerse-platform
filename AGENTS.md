@@ -11,15 +11,24 @@ Before making changes, review:
 - Relevant architecture decisions in `docs/decisions/`
 
 ## Technology Stack
-- Customer website: Next.js with TypeScript
-- Admin website: Next.js with TypeScript
+## Technology Stack
+
+- Customer and admin frontend: One Next.js application with TypeScript
 - Backend: NestJS with TypeScript
 - Database: PostgreSQL
 - ORM: Prisma
 - API: REST
 - Package manager: npm workspaces
 
-These are proposed choices. Do not scaffold applications until the developer approves the implementation plan.
+## Application Architecture
+
+- `apps/web` contains both customer-facing pages and admin routes.
+- `apps/api` contains the backend REST API.
+- Do not create a separate `apps/admin` application for the initial MVP.
+- Admin routes must be protected by proper backend authorization.
+- Hiding admin UI is not a substitute for server-side access control.
+
+These are approved architectural decisions. Ask before introducing major architectural changes.
 
 ## Development Rules
 1. Understand the existing files before making changes.

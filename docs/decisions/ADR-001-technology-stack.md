@@ -10,8 +10,7 @@ We need a maintainable full-stack e-commerce platform that can be developed loca
 
 | Area | Selected technology |
 |---|---|
-| Customer frontend | Next.js |
-| Admin frontend | Next.js |
+| Customer and admin frontend | One Next.js application |
 | Language | TypeScript |
 | Backend | NestJS |
 | API style | REST |
@@ -30,6 +29,7 @@ We need a maintainable full-stack e-commerce platform that can be developed loca
 - Prisma provides schema management and database migrations.
 - npm workspaces can manage multiple applications in one repository.
 - GitHub provides source control and a path to automated CI/CD.
+- A single Next.js application serves customer pages and protected admin routes, reducing duplicate frontend setup and dependencies.
 
 ## Resource Constraints
 - Install tools only when needed.
@@ -44,6 +44,8 @@ We need a maintainable full-stack e-commerce platform that can be developed loca
 - Frontend and backend applications will be developed and tested separately.
 - Database migrations will be version-controlled.
 - Technology choices may be revised if laptop constraints or project requirements justify a change.
+- Customer pages and admin pages share one frontend application.
+- Admin access must be enforced by the backend; hiding admin UI alone is not authorization.
 
 ## Review
 Validate these decisions before creating the application scaffolding. Record significant changes in a new ADR rather than silently changing the architecture.
