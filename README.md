@@ -4,9 +4,8 @@ A full-stack e-commerce platform built using modern web technologies.
 
 ## Project Structure
 
-- `apps/web` - Customer-facing e-commerce application
+- `apps/web` - apps/web - Customer-facing website and admin dashboard
 - `apps/api` - Backend REST API
-- `apps/admin` - Administration dashboard
 - `packages/types` - Shared TypeScript types
 - `packages/ui` - Shared UI components
 - `packages/config` - Shared configuration
