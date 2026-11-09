@@ -8,6 +8,7 @@
     "test": "jest --config ./test/jest-unit.json",
     "test:unit": "jest --config ./test/jest-unit.json",
     "test:e2e": "jest --config ./test/jest-e2e.json",
+    "test:postgres": "jest --config ./test/jest-postgres.json",
     "prisma:seed": "prisma db seed",
     "prisma:validate": "prisma validate",
     "prisma:generate": "prisma generate"
