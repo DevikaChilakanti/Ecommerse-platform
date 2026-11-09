@@ -10,7 +10,7 @@ The PostgreSQL cart integration suite is deliberately separate from the mock-bac
 - Local PostgreSQL authentication configured securely. For Windows, use a suitably ACL-restricted `%APPDATA%\postgresql\pgpass.conf` or an existing trusted local authentication configuration. Never put the password in source code, a command, or test output.
 - Node dependencies already installed for this repository.
 
-The test database name is fixed: `ecommerse_test_db`. Do not substitute `ecommerse_db` or another database.
+The test database name is fixed: `ecommerse_test_db`. The development database `ecommerse_db` must never be used for these tests. Do not substitute it or another database.
 
 ## Provision the isolated database (manual)
 
@@ -27,19 +27,58 @@ Configure local authentication before running the command so PostgreSQL does not
 
 ## Configure the test connection
 
-Set `DATABASE_URL_TEST` in the current PowerShell process. The example deliberately contains no password; configure the local PostgreSQL password file or trusted authentication separately. Replace only the role placeholder:
+Set `DATABASE_URL_TEST` explicitly in the current PowerShell process. The example deliberately contains no password; configure the local PostgreSQL password file or trusted authentication separately. Replace only the role placeholder. This block first removes any inherited `DATABASE_URL`, then validates `DATABASE_URL_TEST` without printing it. Do not echo, display, or otherwise print either connection variable. If validation fails, it throws a generic error before assigning `DATABASE_URL`:
 
 ```powershell
+Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue
 $env:DATABASE_URL_TEST = "postgresql://<local-role>@localhost:5432/ecommerse_test_db?schema=public"
-$testUrl = [System.Uri]$env:DATABASE_URL_TEST
-if (
-  $testUrl.Scheme -notin @("postgres", "postgresql") -or
-  $testUrl.Host -notin @("localhost", "127.0.0.1", "::1") -or
-  $testUrl.Port -ne 5432 -or
-  $testUrl.AbsolutePath.TrimStart("/") -ne "ecommerse_test_db"
-) {
-  throw "DATABASE_URL_TEST must target localhost:5432/ecommerse_test_db."
+$testUrl = $null
+
+if ([string]::IsNullOrWhiteSpace($env:DATABASE_URL_TEST)) {
+  throw "DATABASE_URL_TEST must be explicitly set to a non-empty test URL."
 }
+if (
+  -not [System.Uri]::TryCreate(
+    $env:DATABASE_URL_TEST,
+    [System.UriKind]::Absolute,
+    [ref]$testUrl
+  )
+) {
+  throw "DATABASE_URL_TEST must be a valid absolute PostgreSQL URL."
+}
+
+$testHost = $testUrl.Host -replace '^\[|\]$', ''
+$allowedQuery = $false
+try {
+  $decodedDatabasePath = [System.Uri]::UnescapeDataString($testUrl.AbsolutePath)
+  $query = $testUrl.Query
+  if (-not [string]::IsNullOrEmpty($query)) {
+    $parameters = $query.Substring(1).Split('&')
+    if ($parameters.Count -eq 1 -and $parameters[0].Length -gt 0) {
+      $parts = $parameters[0].Split('=', 2)
+      if ($parts.Length -eq 2) {
+        $key = [System.Uri]::UnescapeDataString($parts[0].Replace('+', ' '))
+        $value = [System.Uri]::UnescapeDataString($parts[1].Replace('+', ' '))
+        $allowedQuery = $key -ceq 'schema' -and $value -ceq 'public'
+      }
+    }
+  }
+} catch {
+  throw "DATABASE_URL_TEST contains invalid encoded URL components."
+}
+
+if (
+  $testUrl.Scheme -notin @('postgres', 'postgresql') -or
+  $testHost -notin @('localhost', '127.0.0.1', '::1') -or
+  $testUrl.Port -ne 5432 -or
+  $decodedDatabasePath -cne '/ecommerse_test_db' -or
+  -not $allowedQuery -or
+  $env:DATABASE_URL_TEST.Contains('#')
+) {
+  throw "DATABASE_URL_TEST must target localhost:5432/ecommerse_test_db with only schema=public."
+}
+
+$env:DATABASE_URL = $env:DATABASE_URL_TEST
 ```
 
 The Jest setup repeats these checks, requires `DATABASE_URL_TEST`, and assigns it to the process-local `DATABASE_URL` before loading the Nest application. It never falls back to an inherited `DATABASE_URL`. The integration test file also imports the guard directly, and its filename is excluded from the existing unit and mock E2E patterns.
@@ -48,10 +87,9 @@ The package script `test:postgres` runs the configuration at `apps/api/test/jest
 
 ## Apply committed migrations
 
-Prisma CLI configuration reads `DATABASE_URL`, so set that variable only after validating the test URL. This command applies committed migrations to the dedicated test database; it does not create/drop/reset a database:
+Prisma CLI configuration reads `DATABASE_URL`, which the validation block above assigns only after every check succeeds. Successful completion of that block confirms the test target; do not print the URL or its credentials. This command applies committed migrations to the dedicated test database; it does not create/drop/reset a database. Never run these migrations against the development database `ecommerse_db`:
 
 ```powershell
-$env:DATABASE_URL = $env:DATABASE_URL_TEST
 npm exec --workspace=apps/api -- prisma migrate deploy
 ```
 
