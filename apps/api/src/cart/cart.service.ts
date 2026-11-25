@@ -39,6 +39,8 @@ type CartRecord = Prisma.CartGetPayload<{ select: typeof CART_SELECT }>;
 type CartTransaction = Prisma.TransactionClient;
 
 const MAX_TRANSACTION_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 25;
+const RETRY_JITTER_MS = 25;
 const MAX_ITEM_QUANTITY = 99;
 
 function isAvailable(
@@ -90,14 +92,50 @@ function cartResponse(cart: CartRecord | null): CartResponse {
 }
 
 function isSerializationConflict(error: unknown): boolean {
-  return (
+  if (
     error instanceof Prisma.PrismaClientKnownRequestError &&
     error.code === "P2034"
+  ) {
+    return true;
+  }
+
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+
+  const errorRecord = error as Record<string, unknown>;
+  if (errorRecord.name !== "DriverAdapterError") {
+    return false;
+  }
+
+  if (
+    typeof errorRecord.cause !== "object" ||
+    errorRecord.cause === null
+  ) {
+    return false;
+  }
+
+  const cause = errorRecord.cause as Record<string, unknown>;
+  return (
+    cause.kind === "TransactionWriteConflict" ||
+    cause.originalCode === "40001"
   );
+}
+
+function retryDelayMs(attempt: number): number {
+  const exponentialDelay = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+  const jitter = Math.floor(Math.random() * RETRY_JITTER_MS);
+  return exponentialDelay + jitter;
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 @Injectable()
 export class CartService {
+  private readonly mutationQueues = new Map<string, Promise<void>>();
+
   constructor(private readonly prisma: PrismaService) {}
 
   async getCart(userId: string): Promise<CartResponse> {
@@ -110,7 +148,7 @@ export class CartService {
   }
 
   async addItem(userId: string, input: AddCartItemDto): Promise<CartResponse> {
-    return this.runSerializable(async (transaction) => {
+    return this.runMutation(userId, async (transaction) => {
       const product = await transaction.product.findFirst({
         where: {
           id: input.productId,
@@ -158,7 +196,7 @@ export class CartService {
     itemId: string,
     input: UpdateCartItemDto,
   ): Promise<CartResponse> {
-    return this.runSerializable(async (transaction) => {
+    return this.runMutation(userId, async (transaction) => {
       const cart = await this.findActiveCart(transaction, userId);
       const item = await transaction.cartItem.findFirst({
         where: { id: itemId, cartId: cart.id },
@@ -178,7 +216,7 @@ export class CartService {
   }
 
   async removeItem(userId: string, itemId: string): Promise<CartResponse> {
-    return this.runSerializable(async (transaction) => {
+    return this.runMutation(userId, async (transaction) => {
       const cart = await this.findActiveCart(transaction, userId);
       const item = await transaction.cartItem.findFirst({
         where: { id: itemId, cartId: cart.id },
@@ -194,7 +232,7 @@ export class CartService {
   }
 
   async clearCart(userId: string): Promise<CartResponse> {
-    return this.runSerializable(async (transaction) => {
+    return this.runMutation(userId, async (transaction) => {
       const cart = await transaction.cart.findFirst({
         where: { userId, status: "ACTIVE" },
         select: { id: true },
@@ -209,6 +247,29 @@ export class CartService {
     });
   }
 
+  private runMutation<T>(
+    userId: string,
+    operation: (transaction: CartTransaction) => Promise<T>,
+  ): Promise<T> {
+    const previous = this.mutationQueues.get(userId) ?? Promise.resolve();
+    const result = previous.then(() => this.runSerializable(operation));
+    const queueTail = result.then(
+      () => {
+        if (this.mutationQueues.get(userId) === queueTail) {
+          this.mutationQueues.delete(userId);
+        }
+      },
+      () => {
+        if (this.mutationQueues.get(userId) === queueTail) {
+          this.mutationQueues.delete(userId);
+        }
+      },
+    );
+
+    this.mutationQueues.set(userId, queueTail);
+    return result;
+  }
+
   private async runSerializable<T>(
     operation: (transaction: CartTransaction) => Promise<T>,
   ): Promise<T> {
@@ -221,6 +282,7 @@ export class CartService {
         if (!isSerializationConflict(error) || attempt === MAX_TRANSACTION_ATTEMPTS) {
           throw error;
         }
+        await wait(retryDelayMs(attempt));
       }
     }
 

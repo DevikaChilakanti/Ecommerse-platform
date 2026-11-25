@@ -196,38 +196,254 @@ describe("CartService", () => {
     expect(transaction.cart.create).not.toHaveBeenCalled();
   });
 
-  it("retries bounded P2034 serialization conflicts", async () => {
-    prisma.$transaction
-      .mockRejectedValueOnce(
-        new Prisma.PrismaClientKnownRequestError("Serialization conflict", {
-          code: "P2034",
-          clientVersion: "7.10.1",
-        }),
-      )
-      .mockImplementationOnce(
-        (operation: (tx: typeof transaction) => Promise<unknown>) =>
-          operation(transaction),
-      );
-    transaction.cart.findFirst.mockResolvedValue(null);
+  it("runs mutations sequentially for the same customer", async () => {
+    let releaseFirst!: () => void;
+    const firstTransaction = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let transactionCount = 0;
+    prisma.$transaction.mockImplementation(async (operation) => {
+      transactionCount += 1;
+      if (transactionCount === 1) {
+        await firstTransaction;
+      }
+      return operation(transaction);
+    });
 
-    await expect(service.clearCart("customer-id")).resolves.toMatchObject({
-      id: null,
-      items: [],
+    const first = service.clearCart("customer-id");
+    const second = service.clearCart("customer-id");
+    await Promise.resolve();
+
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("runs mutations for different customers independently", async () => {
+    let releaseTransactions!: () => void;
+    const transactionsBlocked = new Promise<void>((resolve) => {
+      releaseTransactions = resolve;
+    });
+    prisma.$transaction.mockImplementation(async (operation) => {
+      await transactionsBlocked;
+      return operation(transaction);
+    });
+
+    const first = service.clearCart("customer-one");
+    const second = service.clearCart("customer-two");
+    await Promise.resolve();
+
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    releaseTransactions();
+    await Promise.all([first, second]);
+  });
+
+  it("continues queued mutations after an operation fails", async () => {
+    prisma.$transaction
+      .mockRejectedValueOnce(new Error("Transaction failed"))
+      .mockImplementationOnce((operation) => operation(transaction));
+
+    const first = service.clearCart("customer-id");
+    const second = service.clearCart("customer-id");
+
+    await expect(first).rejects.toThrow("Transaction failed");
+    await expect(second).resolves.toMatchObject({
+      id: "cart-id",
+      items: expect.any(Array),
     });
     expect(prisma.$transaction).toHaveBeenCalledTimes(2);
   });
 
-  it("retries a serializable mutation at most three times and surfaces exhaustion", async () => {
-    const conflict = () =>
-      new Prisma.PrismaClientKnownRequestError("Serialization conflict", {
-        code: "P2034",
-        clientVersion: "7.10.1",
+  it("removes queue entries after successful and failed operations", async () => {
+    const queues = Reflect.get(service, "mutationQueues") as Map<
+      string,
+      Promise<void>
+    >;
+
+    await service.clearCart("customer-id");
+    expect(queues.has("customer-id")).toBe(false);
+
+    prisma.$transaction.mockRejectedValueOnce(new Error("Transaction failed"));
+    await expect(service.clearCart("customer-id")).rejects.toThrow(
+      "Transaction failed",
+    );
+    expect(queues.has("customer-id")).toBe(false);
+  });
+
+  it("retries bounded P2034 serialization conflicts", async () => {
+    jest.useFakeTimers();
+    jest.spyOn(Math, "random").mockReturnValue(0);
+    try {
+      prisma.$transaction
+        .mockRejectedValueOnce(
+          new Prisma.PrismaClientKnownRequestError("Serialization conflict", {
+            code: "P2034",
+            clientVersion: "7.10.1",
+          }),
+        )
+        .mockImplementationOnce(
+          (operation: (tx: typeof transaction) => Promise<unknown>) =>
+            operation(transaction),
+        );
+      transaction.cart.findFirst.mockResolvedValue(null);
+
+      const result = service.clearCart("customer-id");
+      await jest.advanceTimersByTimeAsync(25);
+
+      await expect(result).resolves.toMatchObject({
+        id: null,
+        items: [],
       });
-    prisma.$transaction.mockRejectedValue(conflict());
+      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.restoreAllMocks();
+      jest.useRealTimers();
+    }
+  });
+
+  it("retries DriverAdapterError TransactionWriteConflict conflicts", async () => {
+    jest.useFakeTimers();
+    jest.spyOn(Math, "random").mockReturnValue(0);
+    try {
+      prisma.$transaction
+        .mockRejectedValueOnce(
+          Object.assign(new Error("transaction write conflict"), {
+            name: "DriverAdapterError",
+            cause: { kind: "TransactionWriteConflict" },
+          }),
+        )
+        .mockImplementationOnce(
+          (operation: (tx: typeof transaction) => Promise<unknown>) =>
+            operation(transaction),
+        );
+      transaction.cart.findFirst.mockResolvedValue(null);
+
+      const result = service.clearCart("customer-id");
+      await jest.advanceTimersByTimeAsync(25);
+
+      await expect(result).resolves.toMatchObject({
+        id: null,
+        items: [],
+      });
+      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.restoreAllMocks();
+      jest.useRealTimers();
+    }
+  });
+
+  it("retries DriverAdapterError PostgreSQL 40001 conflicts", async () => {
+    jest.useFakeTimers();
+    jest.spyOn(Math, "random").mockReturnValue(0);
+    try {
+      prisma.$transaction
+        .mockRejectedValueOnce(
+          Object.assign(new Error("serialization failure"), {
+            name: "DriverAdapterError",
+            cause: { originalCode: "40001" },
+          }),
+        )
+        .mockImplementationOnce(
+          (operation: (tx: typeof transaction) => Promise<unknown>) =>
+            operation(transaction),
+        );
+      transaction.cart.findFirst.mockResolvedValue(null);
+
+      const result = service.clearCart("customer-id");
+      await jest.advanceTimersByTimeAsync(25);
+
+      await expect(result).resolves.toMatchObject({
+        id: null,
+        items: [],
+      });
+      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.restoreAllMocks();
+      jest.useRealTimers();
+    }
+  });
+
+  it("uses bounded jittered delays for repeated P2034 conflicts", async () => {
+    jest.useFakeTimers();
+    jest.spyOn(Math, "random").mockReturnValue(0.5);
+    try {
+      const conflict = () =>
+        new Prisma.PrismaClientKnownRequestError("Serialization conflict", {
+          code: "P2034",
+          clientVersion: "7.10.1",
+        });
+      prisma.$transaction
+        .mockRejectedValueOnce(conflict())
+        .mockRejectedValueOnce(conflict())
+        .mockImplementationOnce(
+          (operation: (tx: typeof transaction) => Promise<unknown>) =>
+            operation(transaction),
+        );
+
+      const result = service.clearCart("customer-id");
+
+      await jest.advanceTimersByTimeAsync(37);
+      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+      await jest.advanceTimersByTimeAsync(62);
+
+      await expect(result).resolves.toMatchObject({
+        id: "cart-id",
+        items: expect.any(Array),
+      });
+      expect(prisma.$transaction).toHaveBeenCalledTimes(3);
+    } finally {
+      jest.restoreAllMocks();
+      jest.useRealTimers();
+    }
+  });
+
+  it("retries a serializable mutation at most three times and surfaces exhaustion", async () => {
+    jest.useFakeTimers();
+    jest.spyOn(Math, "random").mockReturnValue(0);
+    try {
+      const conflict = () =>
+        new Prisma.PrismaClientKnownRequestError("Serialization conflict", {
+          code: "P2034",
+          clientVersion: "7.10.1",
+        });
+      prisma.$transaction.mockRejectedValue(conflict());
+
+      const rejection = expect(
+        service.clearCart("customer-id"),
+      ).rejects.toMatchObject({ code: "P2034" });
+
+      await jest.advanceTimersByTimeAsync(25);
+      await jest.advanceTimersByTimeAsync(50);
+      await rejection;
+      expect(prisma.$transaction).toHaveBeenCalledTimes(3);
+    } finally {
+      jest.restoreAllMocks();
+      jest.useRealTimers();
+    }
+  });
+
+  it("does not retry non-P2034 errors", async () => {
+    prisma.$transaction.mockRejectedValue(new Error("Unexpected failure"));
 
     await expect(
       service.clearCart("customer-id"),
-    ).rejects.toMatchObject({ code: "P2034" });
-    expect(prisma.$transaction).toHaveBeenCalledTimes(3);
+    ).rejects.toThrow("Unexpected failure");
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry non-serialization DriverAdapterError values", async () => {
+    prisma.$transaction.mockRejectedValue(
+      Object.assign(new Error("foreign key failure"), {
+        name: "DriverAdapterError",
+        cause: { kind: "ForeignKeyConstraintViolation" },
+      }),
+    );
+
+    await expect(
+      service.clearCart("customer-id"),
+    ).rejects.toMatchObject({ name: "DriverAdapterError" });
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
   });
 });
