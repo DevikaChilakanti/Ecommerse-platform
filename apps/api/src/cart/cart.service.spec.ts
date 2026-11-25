@@ -2,6 +2,7 @@ import { BadRequestException, NotFoundException } from "@nestjs/common";
 import { Prisma } from "../generated/prisma/client";
 import { PrismaService } from "../prisma/prisma.service";
 import { CartService } from "./cart.service";
+import { CustomerMutationQueue } from "./customer-mutation-queue.service";
 
 describe("CartService", () => {
   const cartRecord = {
@@ -75,7 +76,10 @@ describe("CartService", () => {
         operation(transaction),
     ),
   };
-  const service = new CartService(prisma as unknown as PrismaService);
+  const service = new CartService(
+    prisma as unknown as PrismaService,
+    new CustomerMutationQueue(),
+  );
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -194,81 +198,6 @@ describe("CartService", () => {
       where: { cartId: "cart-id" },
     });
     expect(transaction.cart.create).not.toHaveBeenCalled();
-  });
-
-  it("runs mutations sequentially for the same customer", async () => {
-    let releaseFirst!: () => void;
-    const firstTransaction = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-    let transactionCount = 0;
-    prisma.$transaction.mockImplementation(async (operation) => {
-      transactionCount += 1;
-      if (transactionCount === 1) {
-        await firstTransaction;
-      }
-      return operation(transaction);
-    });
-
-    const first = service.clearCart("customer-id");
-    const second = service.clearCart("customer-id");
-    await Promise.resolve();
-
-    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    releaseFirst();
-    await Promise.all([first, second]);
-    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
-  });
-
-  it("runs mutations for different customers independently", async () => {
-    let releaseTransactions!: () => void;
-    const transactionsBlocked = new Promise<void>((resolve) => {
-      releaseTransactions = resolve;
-    });
-    prisma.$transaction.mockImplementation(async (operation) => {
-      await transactionsBlocked;
-      return operation(transaction);
-    });
-
-    const first = service.clearCart("customer-one");
-    const second = service.clearCart("customer-two");
-    await Promise.resolve();
-
-    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
-    releaseTransactions();
-    await Promise.all([first, second]);
-  });
-
-  it("continues queued mutations after an operation fails", async () => {
-    prisma.$transaction
-      .mockRejectedValueOnce(new Error("Transaction failed"))
-      .mockImplementationOnce((operation) => operation(transaction));
-
-    const first = service.clearCart("customer-id");
-    const second = service.clearCart("customer-id");
-
-    await expect(first).rejects.toThrow("Transaction failed");
-    await expect(second).resolves.toMatchObject({
-      id: "cart-id",
-      items: expect.any(Array),
-    });
-    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
-  });
-
-  it("removes queue entries after successful and failed operations", async () => {
-    const queues = Reflect.get(service, "mutationQueues") as Map<
-      string,
-      Promise<void>
-    >;
-
-    await service.clearCart("customer-id");
-    expect(queues.has("customer-id")).toBe(false);
-
-    prisma.$transaction.mockRejectedValueOnce(new Error("Transaction failed"));
-    await expect(service.clearCart("customer-id")).rejects.toThrow(
-      "Transaction failed",
-    );
-    expect(queues.has("customer-id")).toBe(false);
   });
 
   it("retries bounded P2034 serialization conflicts", async () => {

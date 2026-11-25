@@ -8,7 +8,9 @@ import { AppModule } from "../src/app.module";
 import { configureApp } from "../src/configure-app";
 import { SESSION_COOKIE_NAME, SessionService } from "../src/auth/session.service";
 import { CartService } from "../src/cart/cart.service";
+import { CustomerMutationQueue } from "../src/cart/customer-mutation-queue.service";
 import { AddCartItemDto } from "../src/cart/dto/cart-item.dto";
+import { OrdersService } from "../src/orders/orders.service";
 import { PrismaService } from "../src/prisma/prisma.service";
 
 const TEST_DATABASE_NAME = "ecommerse_test_db";
@@ -200,6 +202,194 @@ describe("Shopping cart PostgreSQL integration", () => {
     expect(foreignCarts).toHaveLength(0);
   });
 
+  it("creates an order with snapshots and converts the active cart", async () => {
+    const address = await addAddress(fixture.customers[0]);
+    await request(app.getHttpServer())
+      .post("/api/v1/cart/items")
+      .set("Cookie", fixture.customers[0].cookie)
+      .send({ productId: fixture.productIds[0], quantity: 2 })
+      .expect(201);
+
+    const response = await request(app.getHttpServer())
+      .post("/api/v1/orders")
+      .set("Cookie", fixture.customers[0].cookie)
+      .send({ shippingAddressId: address.id })
+      .expect(201);
+
+    expect(response.body).toMatchObject({
+      orderNumber: expect.stringMatching(/^ORD-/),
+      status: "PENDING",
+      subtotal: "2.5",
+      shippingTotal: "0",
+      taxTotal: "0",
+      grandTotal: "2.5",
+      currencyCode: "USD",
+      shippingRecipientName: "Cart Customer",
+      shippingLine1: "1 Main Street",
+    });
+    expect(response.body.items).toHaveLength(1);
+    expect(response.body.items[0]).toMatchObject({
+      productId: fixture.productIds[0],
+      productName: "Cart integration product 0",
+      sku: expect.stringMatching(/^CART-PG-/),
+      unitPrice: "1.25",
+      quantity: 2,
+      lineTotal: "2.5",
+    });
+
+    const persistedOrder = await prisma.order.findUnique({
+      where: { id: response.body.id },
+      include: { items: true },
+    });
+    expect(persistedOrder?.items[0]).toMatchObject({
+      productName: "Cart integration product 0",
+      unitPrice: new Prisma.Decimal("1.25"),
+      quantity: 2,
+      lineTotal: new Prisma.Decimal("2.50"),
+    });
+
+    const convertedCart = await prisma.cart.findFirst({
+      where: { userId: fixture.customers[0].id, status: "CONVERTED" },
+      include: { items: true },
+    });
+    expect(convertedCart?.items).toEqual([]);
+    await request(app.getHttpServer())
+      .get("/api/v1/cart")
+      .set("Cookie", fixture.customers[0].cookie)
+      .expect(200)
+      .expect(({ body }) => expect(body).toEqual({ id: null, items: [], totals: [] }));
+  });
+
+  it("keeps addresses and orders private to their customer", async () => {
+    await request(app.getHttpServer()).get("/api/v1/addresses").expect(401);
+    await request(app.getHttpServer()).get("/api/v1/orders").expect(401);
+
+    const address = await addAddress(fixture.customers[0]);
+    const primaryAddresses = await request(app.getHttpServer())
+      .get("/api/v1/addresses")
+      .set("Cookie", fixture.customers[0].cookie)
+      .expect(200);
+    const secondaryAddresses = await request(app.getHttpServer())
+      .get("/api/v1/addresses")
+      .set("Cookie", fixture.customers[1].cookie)
+      .expect(200);
+    expect(primaryAddresses.body).toHaveLength(1);
+    expect(secondaryAddresses.body).toEqual([]);
+
+    await request(app.getHttpServer())
+      .post("/api/v1/orders")
+      .set("Cookie", fixture.customers[1].cookie)
+      .send({ shippingAddressId: address.id })
+      .expect(404);
+
+    await request(app.getHttpServer())
+      .post("/api/v1/cart/items")
+      .set("Cookie", fixture.customers[0].cookie)
+      .send({ productId: fixture.productIds[0], quantity: 1 })
+      .expect(201);
+    const order = await request(app.getHttpServer())
+      .post("/api/v1/orders")
+      .set("Cookie", fixture.customers[0].cookie)
+      .send({ shippingAddressId: address.id })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .get(`/api/v1/orders/${order.body.id}`)
+      .set("Cookie", fixture.customers[1].cookie)
+      .expect(404);
+    const foreignHistory = await request(app.getHttpServer())
+      .get("/api/v1/orders")
+      .set("Cookie", fixture.customers[1].cookie)
+      .expect(200);
+    expect(foreignHistory.body).toMatchObject({ data: [], total: 0 });
+  });
+
+  it("rolls back order creation and preserves the cart if clearing fails", async () => {
+    const address = await addAddress(fixture.customers[0]);
+    await request(app.getHttpServer())
+      .post("/api/v1/cart/items")
+      .set("Cookie", fixture.customers[0].cookie)
+      .send({ productId: fixture.productIds[0], quantity: 2 })
+      .expect(201);
+
+    const originalTransaction = prisma.$transaction.bind(prisma);
+    const transactionProxy = new Proxy(prisma, {
+      get(target, property) {
+        if (property !== "$transaction") {
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+
+        return (
+          callback: (transaction: Prisma.TransactionClient) => Promise<unknown>,
+          options: { isolationLevel: Prisma.TransactionIsolationLevel },
+        ) =>
+          originalTransaction(
+            async (transaction) => {
+              const interceptedTransaction = new Proxy(transaction, {
+                get(transactionTarget, transactionProperty) {
+                  if (transactionProperty !== "cartItem") {
+                    return Reflect.get(
+                      transactionTarget,
+                      transactionProperty,
+                      transactionTarget,
+                    ) as unknown;
+                  }
+
+                  const delegate = Reflect.get(
+                    transactionTarget,
+                    "cartItem",
+                    transactionTarget,
+                  ) as object;
+                  return new Proxy(delegate, {
+                    get(delegateTarget, method) {
+                      const value = Reflect.get(
+                        delegateTarget,
+                        method,
+                        delegateTarget,
+                      ) as unknown;
+                      if (method !== "deleteMany" || typeof value !== "function") {
+                        return typeof value === "function"
+                          ? value.bind(delegateTarget)
+                          : value;
+                      }
+
+                      return async (...args: unknown[]) => {
+                        await Reflect.apply(value, delegateTarget, args);
+                        throw new Error("Injected cart clear failure.");
+                      };
+                    },
+                  });
+                },
+              });
+              return callback(interceptedTransaction);
+            },
+            options,
+          );
+      },
+    });
+    const orders = new OrdersService(
+      transactionProxy as PrismaService,
+      new CustomerMutationQueue(),
+    );
+
+    await expect(
+      orders.placeOrder(fixture.customers[0].id, {
+        shippingAddressId: address.id,
+      }),
+    ).rejects.toThrow("Injected cart clear failure.");
+
+    expect(
+      await prisma.order.count({ where: { userId: fixture.customers[0].id } }),
+    ).toBe(0);
+    const activeCart = await prisma.cart.findFirst({
+      where: { userId: fixture.customers[0].id, status: "ACTIVE" },
+      include: { items: true },
+    });
+    expect(activeCart?.items).toHaveLength(1);
+    expect(activeCart?.items[0].quantity).toBe(2);
+  });
+
   it("observes a real PostgreSQL serialization failure and CartService retry", async () => {
     const originalTransaction = prisma.$transaction.bind(prisma);
     const customerId = fixture.customers[0].id;
@@ -308,6 +498,7 @@ describe("Shopping cart PostgreSQL integration", () => {
 
     const instrumentedService = new CartService(
       transactionProxy as PrismaService,
+      new CustomerMutationQueue(),
     );
     const response = await instrumentedService.addItem(customerId, {
       productId: fixture.productIds[0],
@@ -452,8 +643,40 @@ describe("Shopping cart PostgreSQL integration", () => {
     };
   }
 
+  async function addAddress(customer: CustomerFixture) {
+    const response = await request(app.getHttpServer())
+      .post("/api/v1/addresses")
+      .set("Cookie", customer.cookie)
+      .send({
+        label: "Home",
+        recipientName: "Cart Customer",
+        phone: "555-0100",
+        line1: "1 Main Street",
+        city: "Exampleville",
+        region: "CA",
+        postalCode: "90210",
+        countryCode: "US",
+      })
+      .expect(201);
+    return response.body as { id: string };
+  }
+
   async function cleanupFixture(ids: FixtureIds): Promise<void> {
     if (ids.userIds.length > 0) {
+      const orders = await prisma.order.findMany({
+        where: { userId: { in: ids.userIds } },
+        select: { id: true },
+      });
+      const orderIds = orders.map(({ id }) => id);
+      if (orderIds.length > 0) {
+        await prisma.orderItem.deleteMany({
+          where: { orderId: { in: orderIds } },
+        });
+        await prisma.order.deleteMany({
+          where: { id: { in: orderIds } },
+        });
+      }
+
       const carts = await prisma.cart.findMany({
         where: { userId: { in: ids.userIds } },
         select: { id: true },

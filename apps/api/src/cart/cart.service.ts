@@ -5,6 +5,8 @@ import {
 } from "@nestjs/common";
 import { Prisma } from "../generated/prisma/client";
 import { PrismaService } from "../prisma/prisma.service";
+import { runSerializableTransaction } from "../prisma/serializable-transaction";
+import { CustomerMutationQueue } from "./customer-mutation-queue.service";
 import { AddCartItemDto, UpdateCartItemDto } from "./dto/cart-item.dto";
 import {
   CartItemResponse,
@@ -38,9 +40,6 @@ const CART_SELECT = {
 type CartRecord = Prisma.CartGetPayload<{ select: typeof CART_SELECT }>;
 type CartTransaction = Prisma.TransactionClient;
 
-const MAX_TRANSACTION_ATTEMPTS = 3;
-const RETRY_BASE_DELAY_MS = 25;
-const RETRY_JITTER_MS = 25;
 const MAX_ITEM_QUANTITY = 99;
 
 function isAvailable(
@@ -91,52 +90,12 @@ function cartResponse(cart: CartRecord | null): CartResponse {
   return { id: cart.id, items, totals };
 }
 
-function isSerializationConflict(error: unknown): boolean {
-  if (
-    error instanceof Prisma.PrismaClientKnownRequestError &&
-    error.code === "P2034"
-  ) {
-    return true;
-  }
-
-  if (typeof error !== "object" || error === null) {
-    return false;
-  }
-
-  const errorRecord = error as Record<string, unknown>;
-  if (errorRecord.name !== "DriverAdapterError") {
-    return false;
-  }
-
-  if (
-    typeof errorRecord.cause !== "object" ||
-    errorRecord.cause === null
-  ) {
-    return false;
-  }
-
-  const cause = errorRecord.cause as Record<string, unknown>;
-  return (
-    cause.kind === "TransactionWriteConflict" ||
-    cause.originalCode === "40001"
-  );
-}
-
-function retryDelayMs(attempt: number): number {
-  const exponentialDelay = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
-  const jitter = Math.floor(Math.random() * RETRY_JITTER_MS);
-  return exponentialDelay + jitter;
-}
-
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 @Injectable()
 export class CartService {
-  private readonly mutationQueues = new Map<string, Promise<void>>();
-
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly mutationQueue: CustomerMutationQueue,
+  ) {}
 
   async getCart(userId: string): Promise<CartResponse> {
     const cart = await this.prisma.cart.findFirst({
@@ -251,42 +210,9 @@ export class CartService {
     userId: string,
     operation: (transaction: CartTransaction) => Promise<T>,
   ): Promise<T> {
-    const previous = this.mutationQueues.get(userId) ?? Promise.resolve();
-    const result = previous.then(() => this.runSerializable(operation));
-    const queueTail = result.then(
-      () => {
-        if (this.mutationQueues.get(userId) === queueTail) {
-          this.mutationQueues.delete(userId);
-        }
-      },
-      () => {
-        if (this.mutationQueues.get(userId) === queueTail) {
-          this.mutationQueues.delete(userId);
-        }
-      },
+    return this.mutationQueue.run(userId, () =>
+      runSerializableTransaction(this.prisma, operation),
     );
-
-    this.mutationQueues.set(userId, queueTail);
-    return result;
-  }
-
-  private async runSerializable<T>(
-    operation: (transaction: CartTransaction) => Promise<T>,
-  ): Promise<T> {
-    for (let attempt = 1; attempt <= MAX_TRANSACTION_ATTEMPTS; attempt += 1) {
-      try {
-        return await this.prisma.$transaction(operation, {
-          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-        });
-      } catch (error) {
-        if (!isSerializationConflict(error) || attempt === MAX_TRANSACTION_ATTEMPTS) {
-          throw error;
-        }
-        await wait(retryDelayMs(attempt));
-      }
-    }
-
-    throw new Error("Unreachable transaction retry state.");
   }
 
   private async findOrCreateCart(

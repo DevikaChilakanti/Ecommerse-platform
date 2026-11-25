@@ -3,9 +3,11 @@ import { ConfigModule } from "@nestjs/config";
 import { APP_GUARD } from "@nestjs/core";
 import { ThrottlerGuard, ThrottlerModule } from "@nestjs/throttler";
 import { AuthModule } from "./auth/auth.module";
+import { AddressesModule } from "./addresses/addresses.module";
 import { CartModule } from "./cart/cart.module";
 import { CatalogueModule } from "./catalogue/catalogue.module";
 import { HealthModule } from "./health/health.module";
+import { OrdersModule } from "./orders/orders.module";
 import { PrismaModule } from "./prisma/prisma.module";
 
 @Module({
@@ -14,7 +16,9 @@ import { PrismaModule } from "./prisma/prisma.module";
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
     PrismaModule,
     AuthModule,
+    AddressesModule,
     CartModule,
+    OrdersModule,
     CatalogueModule,
     HealthModule,
   ],
